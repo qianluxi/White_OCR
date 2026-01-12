@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>White OCR Web</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h2 { margin-top: 30px; }
+        form { margin-bottom: 20px; }
+        ul { list-style: none; padding-left: 0; }
+        li { margin-bottom: 5px; }
+    </style>
+</head>
+<body>
+    <h1>White OCR Web</h1>
+
+    <!-- 上传 PDF 生成 OCR PDF -->
+    <h2>第一步：生成 OCR PDF</h2>
+    <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
+        <input type="file" name="pdf" accept=".pdf" required>
+        <button type="submit">生成 OCR PDF</button>
+    </form>
+
+    <!-- 上传 PDF 生成白底 PDF -->
+    <h2>第二步：生成白底 PDF</h2>
+    <form action="{{ url_for('generate_white') }}" method="post" enctype="multipart/form-data">
+        <input type="file" name="pdf" accept=".pdf" required>
+        <button type="submit">生成白底 PDF</button>
+    </form>
+
+    <!-- 上传输入 PDF + 白底 PDF 合并 -->
+    <h2>第三步：合并 PDF（交替页）</h2>
+    <form action="{{ url_for('merge_pdfs') }}" method="post" enctype="multipart/form-data">
+        <label>原始 PDF：</label>
+        <input type="file" name="input_pdf" accept=".pdf" required>
+        <br><br>
+        <label>白底 PDF：</label>
+        <input type="file" name="white_pdf" accept=".pdf" required>
+        <br><br>
+        <button type="submit">生成合并 PDF</button>
+    </form>
+
+    <!-- 显示 OCR PDF 列表 -->
+    <h2>OCR PDF 文件列表</h2>
+    <ul>
+        {% if ocr_files %}
+            {% for f in ocr_files %}
+                <li>{{ f }} - <a href="{{ url_for('download', folder='ocr', filename=f) }}">下载</a></li>
+            {% endfor %}
+        {% else %}
+            <li>暂无 OCR PDF 文件</li>
+        {% endif %}
+    </ul>
+
+    <!-- 显示白底 PDF 列表 -->
+    <h2>白底 PDF 文件列表</h2>
+    <ul>
+        {% if white_files %}
+            {% for f in white_files %}
+                <li>{{ f }} - <a href="{{ url_for('download', folder='white', filename=f) }}">下载</a></li>
+            {% endfor %}
+        {% else %}
+            <li>暂无白底 PDF 文件</li>
+        {% endif %}
+    </ul>
+
+    <!-- 显示合并 PDF 列表 -->
+    <h2>合并 PDF 文件列表</h2>
+    <ul>
+        {% if merged_files %}
+            {% for f in merged_files %}
+                <li>{{ f }} - <a href="{{ url_for('download', folder='merged', filename=f) }}">下载</a></li>
+            {% endfor %}
+        {% else %}
+            <li>暂无合并 PDF 文件</li>
+        {% endif %}
+    </ul>
+
+    <!-- Flash 消息显示 -->
+    {% with messages = get_flashed_messages() %}
+        {% if messages %}
+            <ul style="color:red;">
+                {% for msg in messages %}
+                    <li>{{ msg }}</li>
+                {% endfor %}
+            </ul>
+        {% endif %}
+    {% endwith %}
+</body>
+</html>
