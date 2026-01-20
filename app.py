@@ -46,31 +46,46 @@ def merge_alternate_pdfs(input_pdf, white_pdf, output_pdf):
         merged_pdf.save(output_pdf)
 
 # --- 调用 OCRmyPDF Docker ---
-def run_ocrmypdf_docker(input_pdf, output_pdf):
+def run_ocrmypdf_docker(
+    input_pdf,
+    output_pdf,
+    languages="chi_sim+eng",
+    rotate_pages=True,
+    deskew=True,
+    jobs="auto"
+):
     """
-    input_pdf: 原 PDF（可能在 uploads/）
-    output_pdf: OCR 输出 PDF（放在 ocr_outputs/）
+    使用 Docker 调用 OCRmyPDF，支持多语言 / 旋转 / 去倾斜 / 并行
     """
-    abs_input = os.path.abspath(input_pdf)
-    abs_output = os.path.abspath(output_pdf)
-    os.makedirs(OCR_DIR, exist_ok=True)
-    volume_dir = os.path.abspath(OCR_DIR)  # Docker 映射 OCR_DIR
-    input_name = os.path.basename(abs_input)
-    output_name = os.path.basename(abs_output)
-
-    # 如果 input_pdf 不在 OCR_DIR，先拷贝过去
-    #if abs_input != os.path.join(volume_dir, input_name):
-    #    shutil.copy(abs_input, os.path.join(volume_dir, input_name))
 
     cmd = [
         "docker", "run", "--rm",
         "-v", f"{os.path.abspath(UPLOAD_DIR)}:/input",
         "-v", f"{os.path.abspath(OCR_DIR)}:/output",
-        "jbarlow83/ocrmypdf-alpine",
-        f"/input/{os.path.basename(abs_input)}",
-        f"/output/{os.path.basename(abs_output)}"
+        "jbarlow83/ocrmypdf-alpine"
     ]
+
+    # --- OCR 参数 ---
+    if languages:
+        cmd.extend(["-l", languages])
+
+    if rotate_pages:
+        cmd.append("--rotate-pages")
+
+    if deskew:
+        cmd.append("--deskew")
+
+    if jobs:
+        cmd.extend(["-j", jobs])
+
+    # --- 输入输出 ---
+    cmd.extend([
+        f"/input/{os.path.basename(input_pdf)}",
+        f"/output/{os.path.basename(output_pdf)}"
+    ])
+
     subprocess.run(cmd, check=True)
+
 
 # --- 调用白底化脚本 ---
 def run_white_pdf(input_pdf, output_pdf):
@@ -107,30 +122,40 @@ def index():
 # --- 第一步：上传 PDF 生成 OCR PDF ---
 @app.route("/upload", methods=["POST"])
 def upload():
-    if "pdf" not in request.files:
-        flash("请上传 PDF 文件")
+    f = request.files.get("pdf")
+    if not f or f.filename == "":
+        flash("请选择 PDF 文件")
         return redirect(url_for("index"))
 
-    f = request.files["pdf"]
-    if f.filename == "":
-        flash("请选择文件")
-        return redirect(url_for("index"))
-
-    # 上传文件先放在 uploads/
     input_pdf = os.path.join(UPLOAD_DIR, f.filename)
     f.save(input_pdf)
 
-    # OCR PDF 输出放在 ocr_outputs/
     ocr_pdf_name = make_output_name(f.filename, "ocr")
     ocr_pdf_path = os.path.join(OCR_DIR, ocr_pdf_name)
 
+    # --- 接收 OCR 参数 ---
+    languages = request.form.get("languages", "chi_sim+eng")
+    rotate_pages = request.form.get("rotate") == "on"
+    deskew = request.form.get("deskew") == "on"
+    jobs = request.form.get("jobs", "").strip()
+
+    if jobs == "auto":
+        jobs = str(os.cpu_count() or 2)  # 保底 2
+
     try:
-        run_ocrmypdf_docker(input_pdf, ocr_pdf_path)
+        run_ocrmypdf_docker(
+            input_pdf=input_pdf,
+            output_pdf=ocr_pdf_path,
+            languages=languages,
+            rotate_pages=rotate_pages,
+            deskew=deskew,
+            jobs=jobs
+        )
     except subprocess.CalledProcessError as e:
-        flash(f"OCRmyPDF 处理失败: {e}")
+        flash(f"OCR 失败: {e}")
         return redirect(url_for("index"))
 
-    flash(f"OCR PDF 已生成: {ocr_pdf_name}，可下载或进行下一步处理")
+    flash(f"OCR PDF 已生成: {ocr_pdf_name}")
     return redirect(url_for("index"))
 
 # --- 第二步：生成白底 PDF ---

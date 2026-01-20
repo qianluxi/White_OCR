@@ -2,89 +2,317 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>White OCR Web</title>
+    <title>PDF OCR & 处理工具</title>
+
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; }
-        h2 { margin-top: 30px; }
-        form { margin-bottom: 20px; }
-        ul { list-style: none; padding-left: 0; }
-        li { margin-bottom: 5px; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto;
+            background: #f5f7fa;
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 30px auto;
+            background: #ffffff;
+            padding: 30px 40px;
+            border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.08);
+        }
+
+        h1 {
+            text-align: center;
+        }
+
+        h2 {
+            border-left: 5px solid #4f46e5;
+            padding-left: 10px;
+            margin-top: 40px;
+        }
+
+        form {
+            margin-top: 15px;
+            padding: 15px;
+            background: #f9fafb;
+            border-radius: 8px;
+        }
+
+        .form-row {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 12px;
+            flex-wrap: wrap;
+        }
+
+        .form-group {
+            flex: 1;
+            min-width: 220px;
+        }
+
+        label {
+            font-size: 14px;
+            color: #374151;
+            display: block;
+            margin-bottom: 4px;
+        }
+
+        input[type="text"],
+        select {
+            width: 100%;
+            padding: 6px 8px;
+            border-radius: 6px;
+            border: 1px solid #d1d5db;
+        }
+
+        input[type="checkbox"] {
+            margin-right: 6px;
+        }
+
+        button {
+            background: #4f46e5;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        button:disabled {
+            background: #9ca3af;
+            cursor: not-allowed;
+        }
+
+        ul {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        li {
+            padding: 6px 0;
+            display: flex;
+            justify-content: space-between;
+            border-bottom: 1px dashed #ddd;
+        }
+
+        a.download {
+            text-decoration: none;
+            color: #2563eb;
+        }
+
+        .flash {
+            background: #ecfeff;
+            border-left: 4px solid #06b6d4;
+            padding: 10px 15px;
+            margin-bottom: 15px;
+            border-radius: 6px;
+        }
+
+        .hint {
+            font-size: 12px;
+            color: #6b7280;
+            margin-top: 4px;
+        }
+
+        /* ===== OCR Loading 遮罩 ===== */
+        .overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.45);
+            z-index: 999;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .loader-box {
+            background: white;
+            padding: 30px 40px;
+            border-radius: 10px;
+            width: 360px;
+            text-align: center;
+        }
+
+        .progress {
+            height: 10px;
+            background: #e5e7eb;
+            border-radius: 5px;
+            overflow: hidden;
+            margin-top: 15px;
+        }
+
+        .progress-bar {
+            height: 100%;
+            width: 30%;
+            background: #4f46e5;
+            animation: move 1.5s infinite linear;
+        }
+
+        @keyframes move {
+            from { transform: translateX(-100%); }
+            to   { transform: translateX(300%); }
+        }
     </style>
 </head>
-<body>
-    <h1>White OCR Web</h1>
 
-    <!-- 上传 PDF 生成 OCR PDF -->
+<body>
+
+<div class="container">
+    <h1>PDF OCR / 白底化 / 合并工具</h1>
+
+    <!-- Flash -->
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        {% for msg in messages %}
+          <div class="flash">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <!-- OCR -->
     <h2>第一步：生成 OCR PDF</h2>
-    <form action="{{ url_for('upload') }}" method="post" enctype="multipart/form-data">
-        <input type="file" name="pdf" accept=".pdf" required>
-        <button type="submit">生成 OCR PDF</button>
+
+    <form id="ocrForm" enctype="multipart/form-data">
+        <div class="form-row">
+            <div class="form-group">
+                <label>输入 PDF</label>
+                <input type="file" name="pdf" accept=".pdf" required>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>OCR 语言（-l）</label>
+                <input type="text" name="languages" value="chi_sim+eng">
+                <div class="hint">示例：chi_sim、eng、chi_sim+eng</div>
+            </div>
+
+            <div class="form-group">
+                <label>并行任务数（--jobs）</label>
+                <select name="jobs">
+                    <option value="auto" selected>自动（推荐）</option>
+                    <option value="1">1 核</option>
+                    <option value="2">2 核</option>
+                    <option value="4">4 核</option>
+                    <option value="8">8 核</option>
+                </select>
+                <div class="hint">CPU 核心较多时建议 4 或 8</div>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" name="rotate" checked>
+                    自动旋转页面（--rotate-pages）
+                </label>
+                <div class="hint">修正扫描件方向错误</div>
+            </div>
+
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" name="deskew" checked>
+                    去倾斜（--deskew）
+                </label>
+                <div class="hint">修正扫描仪造成的倾斜</div>
+            </div>
+        </div>
+
+        <button type="submit" id="ocrBtn">生成 OCR PDF</button>
     </form>
 
-    <!-- 上传 PDF 生成白底 PDF -->
+    {% if ocr_files %}
+    <ul>
+        {% for f in ocr_files %}
+        <li>
+            <span>{{ f }}</span>
+            <a class="download" href="{{ url_for('download', folder='ocr', filename=f) }}">下载</a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <!-- 白底 -->
     <h2>第二步：生成白底 PDF</h2>
-    <form action="{{ url_for('generate_white') }}" method="post" enctype="multipart/form-data">
+    <form action="/generate_white" method="post" enctype="multipart/form-data">
         <input type="file" name="pdf" accept=".pdf" required>
+        <br><br>
         <button type="submit">生成白底 PDF</button>
     </form>
 
-    <!-- 上传输入 PDF + 白底 PDF 合并 -->
-    <h2>第三步：合并 PDF（交替页）</h2>
-    <form action="{{ url_for('merge_pdfs') }}" method="post" enctype="multipart/form-data">
-        <label>原始 PDF：</label>
-        <input type="file" name="input_pdf" accept=".pdf" required>
-        <br><br>
-        <label>白底 PDF：</label>
-        <input type="file" name="white_pdf" accept=".pdf" required>
-        <br><br>
-        <button type="submit">生成合并 PDF</button>
+    {% if white_files %}
+    <ul>
+        {% for f in white_files %}
+        <li>
+            <span>{{ f }}</span>
+            <a class="download" href="{{ url_for('download', folder='white', filename=f) }}">下载</a>
+        </li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+
+    <!-- 合并 -->
+    <h2>第三步：交替合并 PDF</h2>
+    <form action="/merge_pdfs" method="post" enctype="multipart/form-data">
+        <div>
+            原始 / OCR PDF：
+            <input type="file" name="input_pdf" accept=".pdf" required>
+        </div>
+        <div>
+            白底 PDF：
+            <input type="file" name="white_pdf" accept=".pdf" required>
+        </div>
+        <br>
+        <button type="submit">合并 PDF</button>
     </form>
 
-    <!-- 显示 OCR PDF 列表 -->
-    <h2>OCR PDF 文件列表</h2>
+    {% if merged_files %}
     <ul>
-        {% if ocr_files %}
-            {% for f in ocr_files %}
-                <li>{{ f }} - <a href="{{ url_for('download', folder='ocr', filename=f) }}">下载</a></li>
-            {% endfor %}
-        {% else %}
-            <li>暂无 OCR PDF 文件</li>
-        {% endif %}
+        {% for f in merged_files %}
+        <li>
+            <span>{{ f }}</span>
+            <a class="download" href="{{ url_for('download', folder='merged', filename=f) }}">下载</a>
+        </li>
+        {% endfor %}
     </ul>
+    {% endif %}
+</div>
 
-    <!-- 显示白底 PDF 列表 -->
-    <h2>白底 PDF 文件列表</h2>
-    <ul>
-        {% if white_files %}
-            {% for f in white_files %}
-                <li>{{ f }} - <a href="{{ url_for('download', folder='white', filename=f) }}">下载</a></li>
-            {% endfor %}
-        {% else %}
-            <li>暂无白底 PDF 文件</li>
-        {% endif %}
-    </ul>
+<!-- OCR Loading Overlay -->
+<div class="overlay" id="overlay">
+    <div class="loader-box">
+        <h3>OCR 正在处理中…</h3>
+        <p>请勿关闭页面</p>
+        <div class="progress">
+            <div class="progress-bar"></div>
+        </div>
+    </div>
+</div>
 
-    <!-- 显示合并 PDF 列表 -->
-    <h2>合并 PDF 文件列表</h2>
-    <ul>
-        {% if merged_files %}
-            {% for f in merged_files %}
-                <li>{{ f }} - <a href="{{ url_for('download', folder='merged', filename=f) }}">下载</a></li>
-            {% endfor %}
-        {% else %}
-            <li>暂无合并 PDF 文件</li>
-        {% endif %}
-    </ul>
+<script>
+const form = document.getElementById("ocrForm");
+const overlay = document.getElementById("overlay");
+const btn = document.getElementById("ocrBtn");
 
-    <!-- Flash 消息显示 -->
-    {% with messages = get_flashed_messages() %}
-        {% if messages %}
-            <ul style="color:red;">
-                {% for msg in messages %}
-                    <li>{{ msg }}</li>
-                {% endfor %}
-            </ul>
-        {% endif %}
-    {% endwith %}
+form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const formData = new FormData(form);
+    overlay.style.display = "flex";
+    btn.disabled = true;
+
+    try {
+        await fetch("/upload", {
+            method: "POST",
+            body: formData
+        });
+    } catch (err) {
+        alert("OCR 请求失败");
+    }
+
+    window.location.reload();
+});
+</script>
+
 </body>
 </html>
