@@ -1,9 +1,3 @@
-下面是一份**基于你当前代码“真实能力”重写的 GitHub README**，不夸大、不画饼，完全工程导向，适合直接放到仓库根目录使用。
-
-你可以直接复制保存为 `README.md`。
-
----
-
 # OCR PDF Clean Reconstructor
 
 > Reconstruct a **clean, translation-friendly PDF** from an OCR-generated PDF
