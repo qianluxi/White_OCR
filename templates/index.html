@@ -218,6 +218,19 @@
             </div>
         </div>
 
+        <div class="form-row">
+            <div class="form-group" style="background:#fff7ed;padding:12px;border-radius:8px;">
+                <label style="font-weight:600;">
+                    <input type="checkbox" name="force_ocr">
+                    强制 OCR（--force-ocr）
+                </label>
+                <div class="hint" style="color:#9a3412;">
+                    当 PDF 被标记为 Tagged PDF / 已包含文本层，OCRmyPDF 会拒绝处理。<br>
+                    仅在出现 “TaggedPDFError” 错误时启用。
+                </div>
+            </div>
+        </div>
+
         <button type="submit" id="ocrBtn">生成 OCR PDF</button>
     </form>
 

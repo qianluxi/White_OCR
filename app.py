@@ -50,50 +50,49 @@ def run_ocrmypdf_docker(
     input_pdf,
     output_pdf,
     languages="chi_sim+eng",
-    rotate_pages=True,
+    rotate=True,
     deskew=True,
-    jobs="auto"
+    jobs=4,
+    force_ocr=False
 ):
-    """
-    使用 Docker 调用 OCRmyPDF，支持多语言 / 旋转 / 去倾斜 / 并行
-    """
-
     cmd = [
         "docker", "run", "--rm",
         "-v", f"{os.path.abspath(UPLOAD_DIR)}:/input",
         "-v", f"{os.path.abspath(OCR_DIR)}:/output",
         "jbarlow83/ocrmypdf-alpine"
+        # ❌ 不要再写 "ocrmypdf"
     ]
 
-    # --- OCR 参数 ---
-    if languages:
-        cmd.extend(["-l", languages])
+    # ===== OCR 参数 =====
+    cmd += ["-l", languages]
 
-    if rotate_pages:
+    if rotate:
         cmd.append("--rotate-pages")
 
     if deskew:
         cmd.append("--deskew")
 
-    if jobs:
-        cmd.extend(["-j", jobs])
+    if jobs and isinstance(jobs, int) and jobs > 0:
+        cmd += ["-j", str(jobs)]
 
-    # --- 输入输出 ---
-    cmd.extend([
+    # ⭐ 强制 OCR
+    if force_ocr:
+        cmd.append("--force-ocr")
+
+    # 输入 / 输出（必须放最后）
+    cmd += [
         f"/input/{os.path.basename(input_pdf)}",
         f"/output/{os.path.basename(output_pdf)}"
-    ])
+    ]
 
     subprocess.run(cmd, check=True)
-
-
 # --- 调用白底化脚本 ---
 def run_white_pdf(input_pdf, output_pdf):
     subprocess.run(
         ["python", "ocr_pdf_to_white_text_pdf.py", input_pdf, output_pdf],
         check=True
     )
-
+    
 # --- 首页 ---
 @app.route("/")
 def index():
@@ -127,29 +126,40 @@ def upload():
         flash("请选择 PDF 文件")
         return redirect(url_for("index"))
 
+    # ===== 表单参数 =====
+    languages = request.form.get("languages", "chi_sim+eng")
+    rotate = request.form.get("rotate") == "on"
+    deskew = request.form.get("deskew") == "on"
+    force_ocr = request.form.get("force_ocr") == "on"
+
+    # ⭐ jobs 特殊处理（关键修复点）
+    jobs_raw = request.form.get("jobs", "auto")
+    if jobs_raw == "auto":
+        jobs = None           # 不传 --jobs
+    else:
+        try:
+            jobs = int(jobs_raw)
+        except ValueError:
+            flash("并行任务数参数错误")
+            return redirect(url_for("index"))
+
+    # ===== 保存上传文件 =====
     input_pdf = os.path.join(UPLOAD_DIR, f.filename)
     f.save(input_pdf)
 
+    # ===== OCR 输出文件 =====
     ocr_pdf_name = make_output_name(f.filename, "ocr")
     ocr_pdf_path = os.path.join(OCR_DIR, ocr_pdf_name)
-
-    # --- 接收 OCR 参数 ---
-    languages = request.form.get("languages", "chi_sim+eng")
-    rotate_pages = request.form.get("rotate") == "on"
-    deskew = request.form.get("deskew") == "on"
-    jobs = request.form.get("jobs", "").strip()
-
-    if jobs == "auto":
-        jobs = str(os.cpu_count() or 2)  # 保底 2
 
     try:
         run_ocrmypdf_docker(
             input_pdf=input_pdf,
             output_pdf=ocr_pdf_path,
             languages=languages,
-            rotate_pages=rotate_pages,
+            rotate=rotate,
             deskew=deskew,
-            jobs=jobs
+            jobs=jobs,              # ⭐ None 或 int
+            force_ocr=force_ocr
         )
     except subprocess.CalledProcessError as e:
         flash(f"OCR 失败: {e}")
