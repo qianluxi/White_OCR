@@ -1,92 +1,435 @@
 import sys
-import pikepdf
-from pikepdf import Name
+import fitz  # PyMuPDF
+import re
+import numpy as np
+from collections import Counter, defaultdict
+from typing import List, Dict, Tuple, Optional
 
-
-def remove_all_images_and_xobjects(page):
-    """
-    彻底移除页面中的所有 Image / XObject 引用
-    """
-    if "/Resources" not in page:
-        return
-
-    resources = page["/Resources"]
-
-    # 1. 删除 XObject（Image / Form 等）
-    if "/XObject" in resources:
-        xobjects = resources["/XObject"]
-        for name in list(xobjects.keys()):
-            del xobjects[name]
-
-    # 2. 删除 Pattern（有时会间接引用图像）
-    if "/Pattern" in resources:
-        del resources["/Pattern"]
-
-    # 3. 删除 Shading（防止残留背景渲染）
-    if "/Shading" in resources:
-        del resources["/Shading"]
-
-
-def strip_image_drawing_ops(page, pdf):
-    """
-    从内容流中移除所有图像绘制指令（Do）
-    只保留文本 / 路径指令
-    """
-    if "/Contents" not in page:
-        return
-
-    contents = page.Contents
-
-    if isinstance(contents, pikepdf.Array):
-        streams = contents
-    else:
-        streams = [contents]
-
-    new_streams = []
-
-    for stream in streams:
-        data = stream.read_bytes()
-
-        lines = data.split(b"\n")
-        cleaned = []
-
-        for line in lines:
-            stripped = line.strip()
-
-            # 删除所有 XObject 绘制指令： /Im0 Do
-            if stripped.endswith(b" Do"):
+class AdvancedPDFCleaner:
+    def __init__(self):
+        # 标准字体大小映射（常见中文字体大小）
+        self.standard_sizes = [
+            8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0
+        ]
+        
+        # 页面统计信息缓存
+        self.page_stats = {}
+    
+    def calculate_font_size_intelligent(self, spans: List[Dict], line_bbox: Tuple[float, float, float, float]) -> float:
+        """
+        智能计算字体大小，使用多策略融合
+        """
+        # 策略1: 从span直接获取字体大小
+        direct_sizes = []
+        for span in spans:
+            size = span.get("size", 0)
+            if 5 <= size <= 72:  # 合理范围
+                direct_sizes.append(size)
+        
+        # 策略2: 从字符bbox高度计算
+        char_heights = []
+        for span in spans:
+            chars = span.get("chars", [])
+            for char in chars:
+                bbox = char.get("bbox", [0, 0, 0, 0])
+                height = bbox[3] - bbox[1]
+                if 2 <= height <= 50:  # 合理字符高度范围
+                    char_heights.append(height)
+        
+        # 策略3: 从行bbox高度推断
+        line_height = line_bbox[3] - line_bbox[1]
+        
+        # 收集所有候选尺寸
+        candidates = []
+        
+        # 1. 直接尺寸
+        if direct_sizes:
+            # 使用出现频率最高的尺寸
+            size_counter = Counter(direct_sizes)
+            most_common = size_counter.most_common(1)
+            if most_common:
+                candidates.append(most_common[0][0])
+        
+        # 2. 字符高度
+        if char_heights:
+            # 使用字符高度的中位数（排除异常值）
+            char_heights = np.array(char_heights)
+            q25, q75 = np.percentile(char_heights, [25, 75])
+            iqr = q75 - q25
+            lower_bound = q25 - 1.5 * iqr
+            upper_bound = q75 + 1.5 * iqr
+            
+            filtered_heights = [h for h in char_heights if lower_bound <= h <= upper_bound]
+            if filtered_heights:
+                candidates.append(np.median(filtered_heights))
+        
+        # 3. 行高推断（通常字体大小约为行高的0.6-0.8倍）
+        if 6 <= line_height <= 50:
+            candidates.append(line_height * 0.7)
+        
+        # 如果没有任何候选，使用默认值
+        if not candidates:
+            return 10.5
+        
+        # 从候选尺寸中选择最接近标准尺寸的一个
+        best_size = candidates[0]
+        
+        # 如果有多个候选，使用加权平均
+        if len(candidates) > 1:
+            # 权重：直接尺寸 > 字符高度 > 行高推断
+            weights = [0.6, 0.3, 0.1]
+            weighted_sum = 0
+            total_weight = 0
+            for i, size in enumerate(candidates[:3]):  # 只取前三个
+                weighted_sum += size * weights[i]
+                total_weight += weights[i]
+            
+            if total_weight > 0:
+                weighted_avg = weighted_sum / total_weight
+                best_size = weighted_avg
+        
+        # 标准化到最接近的标准尺寸
+        best_size = self.normalize_to_standard_size(best_size)
+        
+        return best_size
+    
+    def normalize_to_standard_size(self, size: float) -> float:
+        """将计算出的字体大小标准化到最接近的标准尺寸"""
+        if size <= 0:
+            return 10.5
+        
+        # 查找最接近的标准尺寸
+        closest = min(self.standard_sizes, key=lambda x: abs(x - size))
+        
+        # 如果与标准尺寸差距过大，使用计算值
+        if abs(closest - size) / size > 0.3:  # 30%的差异阈值
+            return size
+        
+        return closest
+    
+    def detect_outlier_fonts(self, page_dict: Dict, page_no: int) -> Dict:
+        """检测页面中的异常字体大小"""
+        font_sizes = []
+        
+        for block in page_dict.get("blocks", []):
+            if block.get("type") != 0:
                 continue
+            
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    size = span.get("size", 0)
+                    if 5 <= size <= 72:
+                        font_sizes.append(size)
+        
+        if not font_sizes:
+            return {"has_outliers": False, "median_size": 10.5, "outlier_threshold": 30}
+        
+        # 计算统计信息
+        sizes = np.array(font_sizes)
+        median_size = np.median(sizes)
+        
+        # 计算异常值阈值（使用IQR方法）
+        q25, q75 = np.percentile(sizes, [25, 75])
+        iqr = q75 - q25
+        lower_bound = q25 - 1.5 * iqr
+        upper_bound = q75 + 1.5 * iqr
+        
+        # 存储页面统计信息
+        self.page_stats[page_no] = {
+            "median_size": median_size,
+            "q25": q25,
+            "q75": q75,
+            "iqr": iqr,
+            "lower_bound": lower_bound,
+            "upper_bound": upper_bound,
+            "size_distribution": Counter(font_sizes)
+        }
+        
+        return {
+            "has_outliers": any(s < lower_bound or s > upper_bound for s in sizes),
+            "median_size": median_size,
+            "outlier_threshold": upper_bound
+        }
+    
+    def adjust_font_size_with_context(self, size: float, page_no: int, 
+                                     spans: List[Dict], line_bbox: Tuple) -> float:
+        """根据上下文调整字体大小"""
+        if page_no not in self.page_stats:
+            return size
+        
+        stats = self.page_stats[page_no]
+        median_size = stats["median_size"]
+        upper_bound = stats["upper_bound"]
+        
+        # 如果字体大小超过上限，进行调整
+        if size > upper_bound:
+            # 检查是否可能是标题
+            line_height = line_bbox[3] - line_bbox[1]
+            line_width = line_bbox[2] - line_bbox[0]
+            
+            # 如果文本长度很短，可能是标题
+            total_text = "".join(span.get("text", "") for span in spans)
+            if len(total_text.strip()) <= 20:
+                # 可能是标题，但也不能太大
+                max_title_size = min(median_size * 2.5, 36)  # 最大为36pt或中位数的2.5倍
+                return min(size, max_title_size)
+            else:
+                # 普通文本不应该太大
+                return min(size, median_size * 1.5)
+        
+        # 如果字体大小太小，也进行调整
+        lower_bound = stats["lower_bound"]
+        if size < lower_bound and size > 0:
+            return max(size, median_size * 0.7)  # 至少为中位数的70%
+        
+        return size
+    
+    def process_line_with_fallback(self, line: Dict, page_no: int, 
+                                  page_width: float) -> List[Dict]:
+        """处理一行文本，提供字体大小回退机制"""
+        results = []
+        spans = line.get("spans", [])
+        
+        if not spans:
+            return results
+        
+        # 合并连续相同样式的span
+        merged_spans = self.merge_similar_spans(spans)
+        
+        for span in merged_spans:
+            text = span.get("text", "").strip()
+            if not text:
+                continue
+            
+            # 获取原始字体大小
+            original_size = span.get("size", 0)
+            line_bbox = line.get("bbox", [0, 0, 0, 0])
+            
+            # 智能计算字体大小
+            calculated_size = self.calculate_font_size_intelligent([span], line_bbox)
+            
+            # 如果计算结果与原始值差距太大，使用保守估计
+            if original_size > 0:
+                size_diff = abs(calculated_size - original_size) / original_size
+                if size_diff > 0.5:  # 超过50%的差异
+                    # 使用更保守的方法：取两者中较小的
+                    calculated_size = min(calculated_size, original_size)
+            
+            # 根据上下文调整
+            calculated_size = self.adjust_font_size_with_context(
+                calculated_size, page_no, [span], line_bbox
+            )
+            
+            # 确保字体大小在合理范围内
+            calculated_size = max(5, min(calculated_size, 48))
+            
+            # 检测粗体
+            is_bold = self.is_bold_span(span)
+            
+            # 计算基线位置
+            bbox = span.get("bbox", line_bbox)
+            y_base = self.calculate_baseline(bbox, calculated_size)
+            
+            results.append({
+                "text": text,
+                "x": bbox[0],
+                "y": y_base,
+                "size": calculated_size,
+                "bold": is_bold,
+                "bbox": bbox
+            })
+        
+        return results
+    
+    def merge_similar_spans(self, spans: List[Dict]) -> List[Dict]:
+        """合并相同样式的连续span"""
+        if not spans:
+            return []
+        
+        merged = []
+        current = spans[0].copy()
+        
+        for i in range(1, len(spans)):
+            span = spans[i]
+            
+            # 检查是否与当前span样式相似
+            if self.are_spans_similar(current, span):
+                # 合并文本
+                current["text"] += span.get("text", "")
+                # 更新bbox
+                current_bbox = current.get("bbox", [0, 0, 0, 0])
+                span_bbox = span.get("bbox", [0, 0, 0, 0])
+                if current_bbox and span_bbox:
+                    current["bbox"] = [
+                        min(current_bbox[0], span_bbox[0]),
+                        min(current_bbox[1], span_bbox[1]),
+                        max(current_bbox[2], span_bbox[2]),
+                        max(current_bbox[3], span_bbox[3])
+                    ]
+            else:
+                merged.append(current)
+                current = span.copy()
+        
+        merged.append(current)
+        return merged
+    
+    def are_spans_similar(self, span1: Dict, span2: Dict) -> bool:
+        """判断两个span的样式是否相似"""
+        # 字体大小相似性（相差不超过20%）
+        size1 = span1.get("size", 0)
+        size2 = span2.get("size", 0)
+        if size1 > 0 and size2 > 0:
+            size_diff = abs(size1 - size2) / min(size1, size2)
+            if size_diff > 0.2:
+                return False
+        
+        # 检查字体名称
+        font1 = span1.get("font", "").lower()
+        font2 = span2.get("font", "").lower()
+        
+        # 简单字体分类
+        def get_font_type(font_name):
+            if "bold" in font_name or "black" in font_name:
+                return "bold"
+            elif "italic" in font_name or "oblique" in font_name:
+                return "italic"
+            else:
+                return "regular"
+        
+        if get_font_type(font1) != get_font_type(font2):
+            return False
+        
+        return True
+    
+    def is_bold_span(self, span: Dict) -> bool:
+        """检测span是否为粗体"""
+        font = span.get("font", "").lower()
+        flags = span.get("flags", 0)
+        
+        # 检查字体名称中的粗体标识
+        if "bold" in font or "black" in font or "heavy" in font:
+            return True
+        
+        # 检查字体标志位（位4通常表示粗体）
+        if flags & (1 << 4):
+            return True
+        
+        # 通过字体权重判断（如果有）
+        weight = span.get("weight", 400)
+        if weight >= 600:
+            return True
+        
+        return False
+    
+    def calculate_baseline(self, bbox: List[float], font_size: float) -> float:
+        """计算文本基线位置"""
+        # 通常基线在bbox底部上方约字体大小的1/4处
+        return bbox[3] - (font_size * 0.25)
+    
+    def ocr_pdf_to_clean_pdf(self, input_pdf: str, output_pdf: str):
+        """主处理函数"""
+        doc = fitz.open(input_pdf)
+        new_doc = fitz.open()
+        
+        print("分析PDF文档...")
+        
+        # 第一遍：收集统计信息
+        for page_no, page in enumerate(doc, start=1):
+            page_dict = page.get_text("dict")
+            self.detect_outlier_fonts(page_dict, page_no)
+        
+        # 第二遍：实际处理
+        for page_no, page in enumerate(doc, start=1):
+            print(f"处理第 {page_no}/{len(doc)} 页...")
+            
+            # 创建新页面
+            page_rect = page.rect
+            new_page = new_doc.new_page(width=page_rect.width, height=page_rect.height)
+            
+            # 获取页面结构
+            page_dict = page.get_text("dict")
+            
+            # 按y坐标分组行（近似处理）
+            lines_by_y = defaultdict(list)
+            
+            for block in page_dict.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                
+                for line in block.get("lines", []):
+                    y_pos = line.get("bbox", [0, 0, 0, 0])[1]
+                    y_key = round(y_pos)  # 四舍五入分组
+                    lines_by_y[y_key].append(line)
+            
+            # 按y坐标处理
+            for y_key in sorted(lines_by_y.keys()):
+                lines = lines_by_y[y_key]
+                
+                # 按x坐标排序（处理多列）
+                lines.sort(key=lambda l: l.get("bbox", [0, 0, 0, 0])[0])
+                
+                for line in lines:
+                    # 处理行中的每个span
+                    span_results = self.process_line_with_fallback(
+                        line, page_no, page_rect.width
+                    )
+                    
+                    for result in span_results:
+                        # 选择字体
+                        font_name = "Helvetica-Bold" if result["bold"] else "Helvetica"
+                        
+                        # 插入文本
+                        try:
+                            new_page.insert_text(
+                                (result["x"], result["y"]),
+                                result["text"],
+                                fontname=font_name,
+                                fontsize=result["size"],
+                                color=(0, 0, 0),
+                                render_mode=0,
+                                overlay=True
+                            )
+                        except Exception as e:
+                            print(f"警告: 插入文本失败 - {e}")
+                            # 使用默认值重试
+                            try:
+                                new_page.insert_text(
+                                    (result["x"], result["y"]),
+                                    result["text"],
+                                    fontname="Helvetica",
+                                    fontsize=10.5,
+                                    color=(0, 0, 0),
+                                    render_mode=0,
+                                    overlay=True
+                                )
+                            except:
+                                pass  # 跳过无法插入的文本
+        
+        # 保存结果
+        new_doc.save(output_pdf)
+        new_doc.close()
+        doc.close()
+        
+        print(f"✓ 完成！输出保存至: {output_pdf}")
+        
+        # 打印统计信息
+        print("\n字体大小统计:")
+        for page_no, stats in self.page_stats.items():
+            print(f"  第{page_no}页: 中位数={stats['median_size']:.1f}pt, "
+                  f"范围=[{stats['q25']:.1f}-{stats['q75']:.1f}]pt")
 
-            cleaned.append(line)
 
-        new_data = b"\n".join(cleaned)
-
-        if new_data.strip():
-            new_streams.append(pikepdf.Stream(pdf, new_data))
-
-    if not new_streams:
-        # 保证页面还有一个空内容流，防止某些工具崩溃
-        new_streams = [pikepdf.Stream(pdf, b"")]
-
-    page.Contents = pikepdf.Array(new_streams)
-
-
-def process_pdf(input_pdf, output_pdf):
-    with pikepdf.open(input_pdf, allow_overwriting_input=True) as pdf:
-        for page in pdf.pages:
-            strip_image_drawing_ops(page, pdf)
-            remove_all_images_and_xobjects(page)
-
-        pdf.save(output_pdf)
+def main():
+    if len(sys.argv) != 3:
+        print("用法: python ocr_pdf_to_white_text_pdf.py 输入.pdf 输出.pdf")
+        sys.exit(1)
+    
+    input_pdf = sys.argv[1]
+    output_pdf = sys.argv[2]
+    
+    cleaner = AdvancedPDFCleaner()
+    cleaner.ocr_pdf_to_clean_pdf(input_pdf, output_pdf)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python ocr_pdf_to_white_text_pdf.py input.pdf output.pdf")
-        sys.exit(1)
-
-    input_pdf = sys.argv[1]
-    output_pdf = sys.argv[2]
-
-    process_pdf(input_pdf, output_pdf)
-    print(f"Done. Output saved to: {output_pdf}")
+    main()
