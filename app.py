@@ -1,19 +1,30 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, flash
 import os
+import secrets
 import subprocess
-import shutil
+import sys
 import pikepdf
 
 app = Flask(__name__)
-app.secret_key = "secret_key_for_session"
+# 会话密钥：优先从环境变量读取，否则随机生成
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+
+# 限制上传大小（默认 200MB）
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_UPLOAD_MB", "200")) * 1024 * 1024
+
+@app.errorhandler(413)
+def too_large(_e):
+    flash("文件过大，请上传 200MB 以内的 PDF")
+    return redirect(url_for("index"))
 
 # 文件夹
 UPLOAD_DIR = "uploads"
 OCR_DIR = "ocr_outputs"
 WHITE_DIR = "white_outputs"
+MERGED_DIR = "merged_outputs"
 
 # 创建目录
-for d in [UPLOAD_DIR, OCR_DIR, WHITE_DIR]:
+for d in [UPLOAD_DIR, OCR_DIR, WHITE_DIR, MERGED_DIR]:
     os.makedirs(d, exist_ok=True)
 
 # --- 工具函数 ---
@@ -21,6 +32,38 @@ def make_output_name(original_filename, suffix):
     """根据原始文件名生成输出文件名，去掉时间戳"""
     name, ext = os.path.splitext(original_filename)
     return f"{name}_{suffix}{ext}"
+
+_RESERVED_WIN_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+_FORBIDDEN_CHARS = set('<>:"/\\|?*')
+
+def safe_filename(filename):
+    """清洗上传文件名：去除路径、控制字符和 Windows 非法字符，保留中文"""
+    name = str(filename).replace("\\", "/").split("/")[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in _FORBIDDEN_CHARS)
+    name = name.strip().rstrip(".")
+    if not name:
+        return "upload.pdf"
+    base, _ext = os.path.splitext(name)
+    if base.lower() in _RESERVED_WIN_NAMES:
+        name = "file_" + name
+    return name[:120]
+
+def is_pdf_filename(filename):
+    """校验文件名是否为 PDF"""
+    return filename.lower().endswith(".pdf")
+
+def _remove_files(*paths):
+    """尽力删除失败时产生的文件（忽略错误）"""
+    for p in paths:
+        try:
+            if os.path.isfile(p):
+                os.remove(p)
+        except OSError:
+            pass
 
 def merge_alternate_pdfs(input_pdf, white_pdf, output_pdf):
     """
@@ -89,7 +132,7 @@ def run_ocrmypdf_docker(
 # --- 调用白底化脚本 ---
 def run_white_pdf(input_pdf, output_pdf):
     subprocess.run(
-        ["python", "ocr_pdf_to_white_text_pdf.py", input_pdf, output_pdf],
+        [sys.executable, "ocr_pdf_to_white_text_pdf.py", input_pdf, output_pdf],
         check=True
     )
     
@@ -126,6 +169,11 @@ def upload():
         flash("请选择 PDF 文件")
         return redirect(url_for("index"))
 
+    filename = safe_filename(f.filename)
+    if not is_pdf_filename(filename):
+        flash("仅支持 PDF 文件")
+        return redirect(url_for("index"))
+
     # ===== 表单参数 =====
     languages = request.form.get("languages", "chi_sim+eng")
     rotate = request.form.get("rotate") == "on"
@@ -144,11 +192,11 @@ def upload():
             return redirect(url_for("index"))
 
     # ===== 保存上传文件 =====
-    input_pdf = os.path.join(UPLOAD_DIR, f.filename)
+    input_pdf = os.path.join(UPLOAD_DIR, filename)
     f.save(input_pdf)
 
     # ===== OCR 输出文件 =====
-    ocr_pdf_name = make_output_name(f.filename, "ocr")
+    ocr_pdf_name = make_output_name(filename, "ocr")
     ocr_pdf_path = os.path.join(OCR_DIR, ocr_pdf_name)
 
     try:
@@ -161,8 +209,9 @@ def upload():
             jobs=jobs,              # ⭐ None 或 int
             force_ocr=force_ocr
         )
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         flash(f"OCR 失败: {e}")
+        _remove_files(input_pdf, ocr_pdf_path)
         return redirect(url_for("index"))
 
     flash(f"OCR PDF 已生成: {ocr_pdf_name}")
@@ -176,18 +225,24 @@ def generate_white():
         flash("请上传 PDF 文件")
         return redirect(url_for("index"))
 
+    filename = safe_filename(uploaded_file.filename)
+    if not is_pdf_filename(filename):
+        flash("仅支持 PDF 文件")
+        return redirect(url_for("index"))
+
     # 上传文件先放在 uploads/
-    input_pdf = os.path.join(UPLOAD_DIR, uploaded_file.filename)
+    input_pdf = os.path.join(UPLOAD_DIR, filename)
     uploaded_file.save(input_pdf)
 
     # 白底 PDF 输出
-    white_pdf_name = make_output_name(uploaded_file.filename, "white")
+    white_pdf_name = make_output_name(filename, "white")
     white_pdf_path = os.path.join(WHITE_DIR, white_pdf_name)
 
     try:
         run_white_pdf(input_pdf, white_pdf_path)
-    except subprocess.CalledProcessError as e:
+    except Exception as e:
         flash(f"白底化处理失败: {e}")
+        _remove_files(input_pdf, white_pdf_path)
         return redirect(url_for("index"))
 
     flash(f"白底 PDF 已生成: {white_pdf_name}，可下载")
@@ -208,8 +263,13 @@ def download(folder, filename):
         flash("非法下载目录")
         return redirect(url_for("index"))
 
-    directory = folder_map[folder]
-    file_path = os.path.join(directory, filename)
+    directory = os.path.abspath(folder_map[folder])
+    file_path = os.path.abspath(os.path.join(directory, filename))
+
+    # 校验文件名不能逃逸目标目录（防路径穿越）
+    if not (file_path == directory or file_path.startswith(directory + os.sep)):
+        flash("非法文件名")
+        return redirect(url_for("index"))
 
     # 校验文件是否存在
     if not os.path.isfile(file_path):
@@ -223,9 +283,6 @@ def download(folder, filename):
         download_name=filename  # Flask >=2.0，确保下载名正确
     )
 
-MERGED_DIR = "merged_outputs"
-os.makedirs(MERGED_DIR, exist_ok=True)
-
 @app.route("/merge_pdfs", methods=["POST"])
 def merge_pdfs():
     input_file = request.files.get("input_pdf")
@@ -235,24 +292,36 @@ def merge_pdfs():
         flash("请上传两个 PDF 文件")
         return redirect(url_for("index"))
 
+    input_name = safe_filename(input_file.filename)
+    white_name = safe_filename(white_file.filename)
+    if not (is_pdf_filename(input_name) and is_pdf_filename(white_name)):
+        flash("请上传两个 PDF 文件")
+        return redirect(url_for("index"))
+
     # 保存上传文件到 uploads/
-    input_path = os.path.join(UPLOAD_DIR, input_file.filename)
-    white_path = os.path.join(WHITE_DIR, white_file.filename)
+    input_path = os.path.join(UPLOAD_DIR, input_name)
+    white_path = os.path.join(WHITE_DIR, white_name)
     input_file.save(input_path)
     white_file.save(white_path)
 
     # 输出文件
-    merged_name = f"{os.path.splitext(input_file.filename)[0]}_merged.pdf"
+    merged_name = f"{os.path.splitext(input_name)[0]}_merged.pdf"
     merged_path = os.path.join(MERGED_DIR, merged_name)
 
     try:
         merge_alternate_pdfs(input_path, white_path, merged_path)
     except Exception as e:
         flash(f"合并失败: {e}")
+        _remove_files(input_path, white_path, merged_path)
         return redirect(url_for("index"))
 
     flash(f"合并 PDF 已生成: {merged_name}")
     return redirect(url_for("index"))
 
 if __name__ == "__main__":
-    app.run(debug=True, use_reloader=False)
+    app.run(
+        host="127.0.0.1",
+        port=int(os.environ.get("PORT", "5000")),
+        debug=os.environ.get("FLASK_DEBUG", "0") == "1",
+        use_reloader=False
+    )

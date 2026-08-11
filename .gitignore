@@ -1,0 +1,15 @@
+# 运行时目录
+uploads/
+ocr_outputs/
+white_outputs/
+merged_outputs/
+
+# 日志
+*.log
+
+# 测试 / 临时文件
+test*.pdf
+
+# Python 缓存
+__pycache__/
+*.pyc

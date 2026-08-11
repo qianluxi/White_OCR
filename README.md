@@ -42,7 +42,7 @@ This project provides a **layout-aware OCR PDF reconstruction tool** that:
 * Reconstructs a **new PDF from scratch**:
 
   * white background
-  * unified font (Helvetica / Helvetica-Bold)
+  * unified fonts (Helvetica for Latin text, built-in CJK font for Chinese)
   * selectable text layer
 * Uses **statistical + contextual font size inference**
 * Preserves:
@@ -112,9 +112,11 @@ Fallback behavior:
 
 ```text
 .
+├── app.py                         # Flask web UI (3-step pipeline)
 ├── ocr_pdf_to_white_text_pdf.py   # Main script (can replace legacy version)
-├── README.md
-└── requirements.txt
+├── templates/index.html           # Web UI template
+├── requirements.txt
+└── README.md
 ```
 
 ---
@@ -124,7 +126,7 @@ Fallback behavior:
 ### 1. Install Dependencies
 
 ```bash
-pip install pymupdf numpy
+pip install -r requirements.txt
 ```
 
 > Python ≥ 3.8 recommended
@@ -142,6 +144,19 @@ python ocr_pdf_to_white_text_pdf.py input_ocr.pdf output_clean.pdf
 
 * `output_clean.pdf`
   A clean, reconstructed, translation-friendly PDF
+
+### 3. Run the Web App
+
+```bash
+python app.py
+# Open http://127.0.0.1:5000
+```
+
+* Step 1 (OCR) requires Docker with the `jbarlow83/ocrmypdf-alpine` image.
+* Environment variables:
+  * `FLASK_DEBUG=1` — enable Flask debug mode (default: off)
+  * `SECRET_KEY=...` — session key (default: randomly generated)
+  * `MAX_UPLOAD_MB=200` — upload size limit
 
 ---
 

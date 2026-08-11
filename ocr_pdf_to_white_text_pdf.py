@@ -1,9 +1,9 @@
+import os
 import sys
-import fitz  # PyMuPDF
-import re
+import pymupdf as fitz  # PyMuPDF
 import numpy as np
 from collections import Counter, defaultdict
-from typing import List, Dict, Tuple, Optional
+from typing import Dict, List, Tuple
 
 class AdvancedPDFCleaner:
     def __init__(self):
@@ -14,6 +14,16 @@ class AdvancedPDFCleaner:
         
         # 页面统计信息缓存
         self.page_stats = {}
+        # 字体缓存
+        self._font_cache = {}
+
+    def get_font(self, name: str) -> "fitz.Font":
+        """获取（并缓存）字体对象"""
+        font = self._font_cache.get(name)
+        if font is None:
+            font = fitz.Font(fontname=name)
+            self._font_cache[name] = font
+        return font
     
     def calculate_font_size_intelligent(self, spans: List[Dict], line_bbox: Tuple[float, float, float, float]) -> float:
         """
@@ -165,7 +175,6 @@ class AdvancedPDFCleaner:
         if size > upper_bound:
             # 检查是否可能是标题
             line_height = line_bbox[3] - line_bbox[1]
-            line_width = line_bbox[2] - line_bbox[0]
             
             # 如果文本长度很短，可能是标题
             total_text = "".join(span.get("text", "") for span in spans)
@@ -197,7 +206,11 @@ class AdvancedPDFCleaner:
         merged_spans = self.merge_similar_spans(spans)
         
         for span in merged_spans:
-            text = span.get("text", "").strip()
+            # rawdict 模式下 span 没有 "text" 键，需要从 chars 拼接
+            text = span.get("text") or "".join(
+                ch.get("c", "") for ch in span.get("chars", [])
+            )
+            text = text.strip()
             if not text:
                 continue
             
@@ -226,17 +239,16 @@ class AdvancedPDFCleaner:
             # 检测粗体
             is_bold = self.is_bold_span(span)
             
-            # 计算基线位置
-            bbox = span.get("bbox", line_bbox)
-            y_base = self.calculate_baseline(bbox, calculated_size)
+            # 计算 x 坐标和基线位置
+            span_bbox = span.get("bbox", line_bbox)
+            y_base = self.calculate_baseline(span, calculated_size)
             
             results.append({
                 "text": text,
-                "x": bbox[0],
+                "x": span_bbox[0],
                 "y": y_base,
                 "size": calculated_size,
-                "bold": is_bold,
-                "bbox": bbox
+                "bold": is_bold
             })
         
         return results
@@ -255,7 +267,9 @@ class AdvancedPDFCleaner:
             # 检查是否与当前span样式相似
             if self.are_spans_similar(current, span):
                 # 合并文本
-                current["text"] += span.get("text", "")
+                current["text"] = current.get("text", "") + span.get("text", "")
+                # 合并字符信息（保留 origin，用于基线计算）
+                current["chars"] = current.get("chars", []) + span.get("chars", [])
                 # 更新bbox
                 current_bbox = current.get("bbox", [0, 0, 0, 0])
                 span_bbox = span.get("bbox", [0, 0, 0, 0])
@@ -321,13 +335,50 @@ class AdvancedPDFCleaner:
         
         return False
     
-    def calculate_baseline(self, bbox: List[float], font_size: float) -> float:
-        """计算文本基线位置"""
+    def calculate_baseline(self, span: Dict, font_size: float) -> float:
+        """计算文本基线位置：优先使用字符 origin（真实基线），否则用经验公式"""
+        chars = span.get("chars") or []
+        origins = [
+            c.get("origin")
+            for c in chars
+            if isinstance(c.get("origin"), (list, tuple)) and len(c.get("origin")) == 2
+        ]
+        if origins:
+            # 取所有字符原点 y 的中位数作为行基线，排除异常值
+            ys = sorted(origin[1] for origin in origins)
+            return ys[len(ys) // 2]
+        bbox = span.get("bbox", [0, 0, 0, 0])
         # 通常基线在bbox底部上方约字体大小的1/4处
         return bbox[3] - (font_size * 0.25)
+
+    def choose_font(self, text: str, is_bold: bool) -> str:
+        """选择字体：纯拉丁文本用 Helvetica（可保留粗体），
+        含中文等字符时用 PyMuPDF 内置 CJK 字体（Helvetica 无法编码会丢字）"""
+        try:
+            text.encode("latin-1")
+        except UnicodeEncodeError:
+            return "china-s"
+        return "Helvetica-Bold" if is_bold else "Helvetica"
+
+    def fit_text_width(self, result: Dict, page_width: float) -> None:
+        """文本超出页面右边界时按比例缩小字号，防止 PyMuPDF 静默截断丢字"""
+        available = page_width - result["x"]
+        if available <= 0:
+            return
+        try:
+            font = self.get_font(self.choose_font(result["text"], result["bold"]))
+            text_width = font.text_length(result["text"], fontsize=result["size"])
+            if text_width > available:
+                result["size"] = max(5.0, result["size"] * available / text_width)
+        except Exception:
+            pass  # 字体测量失败时保持原样
     
     def ocr_pdf_to_clean_pdf(self, input_pdf: str, output_pdf: str):
         """主处理函数"""
+        if os.path.abspath(input_pdf) == os.path.abspath(output_pdf):
+            print("错误: 输入和输出不能是同一个文件")
+            sys.exit(1)
+
         doc = fitz.open(input_pdf)
         new_doc = fitz.open()
         
@@ -335,7 +386,7 @@ class AdvancedPDFCleaner:
         
         # 第一遍：收集统计信息
         for page_no, page in enumerate(doc, start=1):
-            page_dict = page.get_text("dict")
+            page_dict = page.get_text("rawdict")
             self.detect_outlier_fonts(page_dict, page_no)
         
         # 第二遍：实际处理
@@ -347,7 +398,7 @@ class AdvancedPDFCleaner:
             new_page = new_doc.new_page(width=page_rect.width, height=page_rect.height)
             
             # 获取页面结构
-            page_dict = page.get_text("dict")
+            page_dict = page.get_text("rawdict")
             
             # 按y坐标分组行（近似处理）
             lines_by_y = defaultdict(list)
@@ -361,7 +412,8 @@ class AdvancedPDFCleaner:
                     y_key = round(y_pos)  # 四舍五入分组
                     lines_by_y[y_key].append(line)
             
-            # 按y坐标处理
+            # 按y坐标处理（用 TextWriter，避免 insert_text 对 CJK 字体度量错误导致截断）
+            writer = fitz.TextWriter(page_rect)
             for y_key in sorted(lines_by_y.keys()):
                 lines = lines_by_y[y_key]
                 
@@ -375,38 +427,36 @@ class AdvancedPDFCleaner:
                     )
                     
                     for result in span_results:
-                        # 选择字体
-                        font_name = "Helvetica-Bold" if result["bold"] else "Helvetica"
+                        # 选择字体：中文等字符使用内置 CJK 字体，避免 Helvetica 无法编码
+                        font_name = self.choose_font(result["text"], result["bold"])
+
+                        # 防止文本超出页面右边界被静默截断：超宽时缩小字号
+                        self.fit_text_width(result, page_rect.width)
                         
                         # 插入文本
                         try:
-                            new_page.insert_text(
+                            writer.append(
                                 (result["x"], result["y"]),
                                 result["text"],
-                                fontname=font_name,
-                                fontsize=result["size"],
-                                color=(0, 0, 0),
-                                render_mode=0,
-                                overlay=True
+                                font=self.get_font(font_name),
+                                fontsize=result["size"]
                             )
                         except Exception as e:
                             print(f"警告: 插入文本失败 - {e}")
-                            # 使用默认值重试
+                            # 回退到内置 CJK 字体重试
                             try:
-                                new_page.insert_text(
+                                writer.append(
                                     (result["x"], result["y"]),
                                     result["text"],
-                                    fontname="Helvetica",
-                                    fontsize=10.5,
-                                    color=(0, 0, 0),
-                                    render_mode=0,
-                                    overlay=True
+                                    font=self.get_font("china-s"),
+                                    fontsize=10.5
                                 )
-                            except:
-                                pass  # 跳过无法插入的文本
+                            except Exception as e2:
+                                print(f"错误: 文本无法插入，已跳过（{result['text'][:20]!r}）: {e2}")
+            writer.write_text(new_page, color=(0, 0, 0))
         
         # 保存结果
-        new_doc.save(output_pdf)
+        new_doc.save(output_pdf, garbage=3, deflate=True)
         new_doc.close()
         doc.close()
         
